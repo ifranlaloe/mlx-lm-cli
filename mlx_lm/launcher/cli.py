@@ -32,6 +32,7 @@ class LaunchConfig:
     host: str
     port: int
     wait_seconds: int
+    launch_cwd: str
     app_args: List[str]
 
 
@@ -94,6 +95,36 @@ def _split_launcher_args(argv: Sequence[str]) -> Tuple[List[str], List[str]]:
         return list(argv), []
     split_index = argv.index("--")
     return list(argv[:split_index]), list(argv[split_index + 1 :])
+
+
+def _validate_directory(raw_value: str, flag: str) -> str:
+    normalized = _validate_non_empty(raw_value, flag)
+    path = Path(normalized).expanduser()
+    if not path.exists():
+        raise ValueError(f"Invalid {flag} '{raw_value}': directory does not exist.")
+    if not path.is_dir():
+        raise ValueError(f"Invalid {flag} '{raw_value}': must be a directory.")
+    return str(path)
+
+
+def _default_launch_cwd() -> str:
+    cwd = Path.cwd()
+    repo_root = Path(__file__).resolve().parents[2]
+    oldpwd = os.getenv("OLDPWD")
+
+    # When callers use a local shell wrapper that `cd`s into this repository to
+    # run the module, keep the launched CLI in the original shell directory.
+    if cwd == repo_root and oldpwd:
+        oldpwd_path = Path(oldpwd).expanduser()
+        if oldpwd_path.is_dir() and oldpwd_path != cwd:
+            return str(oldpwd_path)
+    return str(cwd)
+
+
+def _resolve_launch_cwd(raw_cwd: Optional[str]) -> str:
+    if raw_cwd is None:
+        return _default_launch_cwd()
+    return _validate_directory(raw_cwd, "--cwd")
 
 
 def _set_default_if_empty(env: Dict[str, str], key: str, value: str):
@@ -205,8 +236,20 @@ def _ensure_codex_config(base_url: str):
     config_path.write_text(content, encoding="utf-8")
 
 
+def _codex_app_args_set_cwd(app_args: Sequence[str]) -> bool:
+    return any(
+        arg in {"--cd", "-C"} or arg.startswith("--cd=") or arg.startswith("-C")
+        for arg in app_args
+    )
+
+
 def _build_launch_command(
-    target: str, command: str, model: str, base_url: str, app_args: Sequence[str]
+    target: str,
+    command: str,
+    model: str,
+    base_url: str,
+    app_args: Sequence[str],
+    launch_cwd: str,
 ) -> List[str]:
     if target != "codex":
         return [command, *app_args]
@@ -214,6 +257,8 @@ def _build_launch_command(
     codex_args = ["--profile", CODEX_PROFILE_NAME]
     if model:
         codex_args += ["-m", model]
+    if launch_cwd and not _codex_app_args_set_cwd(app_args):
+        codex_args += ["--cd", launch_cwd]
     return [command, *codex_args, *app_args]
 
 
@@ -253,6 +298,14 @@ def _parse_args(argv: Sequence[str]) -> LaunchConfig:
             f"(default: env MLX_WAIT_SECONDS or {DEFAULT_WAIT_SECONDS})."
         ),
     )
+    parser.add_argument(
+        "--cwd",
+        default=os.getenv("MLX_LAUNCH_CWD"),
+        help=(
+            "Working directory for the launched CLI "
+            "(default: current directory; supports env MLX_LAUNCH_CWD)."
+        ),
+    )
 
     launcher_argv, app_args = _split_launcher_args(argv)
     args, unknown = parser.parse_known_args(launcher_argv)
@@ -269,6 +322,7 @@ def _parse_args(argv: Sequence[str]) -> LaunchConfig:
         wait_seconds = _validate_int(
             args.wait_seconds, "--wait-seconds", minimum=1
         )
+        launch_cwd = _resolve_launch_cwd(args.cwd)
     except ValueError as e:
         parser.error(str(e))
 
@@ -278,6 +332,7 @@ def _parse_args(argv: Sequence[str]) -> LaunchConfig:
         host=host,
         port=port,
         wait_seconds=wait_seconds,
+        launch_cwd=launch_cwd,
         app_args=app_args,
     )
 
@@ -310,7 +365,13 @@ def main():
         config.model,
         base_url,
         config.app_args,
+        config.launch_cwd,
     )
     _print_launch_message(config.target, launch_env)
-    completed = subprocess.run(launch_command, env=launch_env, check=False)
+    completed = subprocess.run(
+        launch_command,
+        env=launch_env,
+        cwd=config.launch_cwd,
+        check=False,
+    )
     raise SystemExit(completed.returncode)

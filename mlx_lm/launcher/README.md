@@ -69,6 +69,13 @@ mlx_lm launch codex \
   --wait-seconds 45
 ```
 
+### 5) Launch in a specific working directory
+
+```bash
+mlx_lm launch codex --model mlx-community/Qwen3.6-35B-A3B-4bit --cwd "$PWD"
+mlx_lm launch copilot --model mlx-community/Qwen3.6-35B-A3B-4bit --cwd "$PWD"
+```
+
 ## Environment variables
 
 ### Common launcher defaults
@@ -79,6 +86,11 @@ mlx_lm launch codex \
 | `HOST` | `127.0.0.1` |
 | `PORT` | `8080` |
 | `MLX_WAIT_SECONDS` | `30` |
+| `MLX_LAUNCH_CWD` | current directory |
+
+If the launcher is invoked through a local shell wrapper that temporarily `cd`s
+into this repo, launchers will fall back to `$OLDPWD` so Codex/Copilot still
+open in your original shell directory.
 
 ### Executable override
 

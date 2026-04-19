@@ -30,6 +30,14 @@ class TestLauncherCLI(unittest.TestCase):
         self.assertEqual(config.model, "repo/model")
         self.assertEqual(config.app_args, ["--help"])
 
+    def test_parse_args_accepts_explicit_cwd(self):
+        with TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {}, clear=True):
+                config = launcher_cli._parse_args(
+                    ["codex", "--model", "repo/model", "--cwd", tmp]
+                )
+        self.assertEqual(config.launch_cwd, tmp)
+
     def test_parse_args_rejects_unknown_launcher_flags(self):
         stderr = io.StringIO()
         with patch("sys.stderr", stderr):
@@ -37,6 +45,16 @@ class TestLauncherCLI(unittest.TestCase):
                 launcher_cli._parse_args(["codex", "--bad-flag"])
         self.assertEqual(ex.exception.code, 2)
         self.assertIn("Unknown launcher arg(s): --bad-flag", stderr.getvalue())
+
+    def test_default_launch_cwd_falls_back_to_oldpwd_from_repo_wrapper(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        with TemporaryDirectory() as tmp:
+            with (
+                patch.object(launcher_cli.Path, "cwd", return_value=repo_root),
+                patch.dict(os.environ, {"OLDPWD": tmp}, clear=True),
+            ):
+                launch_cwd = launcher_cli._default_launch_cwd()
+        self.assertEqual(launch_cwd, tmp)
 
     def test_copilot_env_defaults_to_responses_wire_api(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -70,17 +88,34 @@ class TestLauncherCLI(unittest.TestCase):
     def test_codex_launch_command_uses_profile_and_model(self):
         model = "mlx-community/Qwen3.6-35B-A3B-4bit"
         base_url = "http://127.0.0.1:8080/v1"
+        launch_cwd = "/tmp/workspace"
         command = launcher_cli._build_launch_command(
             "codex",
             "codex",
             model,
             base_url,
             ["--help"],
+            launch_cwd,
         )
 
         self.assertEqual(command[:3], ["codex", "--profile", launcher_cli.CODEX_PROFILE_NAME])
         self.assertEqual(command[3:5], ["-m", model])
+        self.assertEqual(command[5:7], ["--cd", launch_cwd])
         self.assertEqual(command[-1], "--help")
+
+    def test_codex_launch_command_preserves_explicit_cwd_arg(self):
+        model = "mlx-community/Qwen3.6-35B-A3B-4bit"
+        base_url = "http://127.0.0.1:8080/v1"
+        command = launcher_cli._build_launch_command(
+            "codex",
+            "codex",
+            model,
+            base_url,
+            ["--cd", "/my/project", "--help"],
+            "/tmp/workspace",
+        )
+        self.assertEqual(command.count("--cd"), 1)
+        self.assertIn("/my/project", command)
 
     def test_non_codex_launch_command_is_passthrough(self):
         command = launcher_cli._build_launch_command(
@@ -89,8 +124,40 @@ class TestLauncherCLI(unittest.TestCase):
             "ignored",
             "http://127.0.0.1:8080/v1",
             ["--help"],
+            "/tmp/workspace",
         )
         self.assertEqual(command, ["copilot", "--help"])
+
+    def test_main_runs_target_in_resolved_cwd(self):
+        config = launcher_cli.LaunchConfig(
+            target="copilot",
+            model="mlx-community/Qwen3.6-35B-A3B-4bit",
+            host="127.0.0.1",
+            port=8080,
+            wait_seconds=30,
+            launch_cwd="/tmp/workspace",
+            app_args=["--help"],
+        )
+        with (
+            patch.object(launcher_cli, "_parse_args", return_value=config),
+            patch.object(launcher_cli, "_command_for_target", return_value="copilot"),
+            patch.object(launcher_cli, "_wait_for_server", return_value=True),
+            patch.object(launcher_cli, "_build_env", return_value={}),
+            patch.object(
+                launcher_cli,
+                "_build_launch_command",
+                return_value=["copilot", "--help"],
+            ),
+            patch.object(launcher_cli, "_print_launch_message"),
+            patch.object(launcher_cli.subprocess, "run") as mock_run,
+        ):
+            mock_run.return_value.returncode = 0
+            with self.assertRaises(SystemExit) as ex:
+                launcher_cli.main()
+
+        self.assertEqual(ex.exception.code, 0)
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs["cwd"], "/tmp/workspace")
 
     def test_ensure_codex_config_writes_profile_and_provider_sections(self):
         with TemporaryDirectory() as tmp:
