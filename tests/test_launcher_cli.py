@@ -30,6 +30,20 @@ class TestLauncherCLI(unittest.TestCase):
         self.assertEqual(config.model, "repo/model")
         self.assertEqual(config.app_args, ["--help"])
 
+    def test_parse_args_requires_model_when_missing(self):
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("sys.stderr", stderr):
+                with self.assertRaises(SystemExit) as ex:
+                    launcher_cli._parse_args(["codex"])
+        self.assertEqual(ex.exception.code, 2)
+        self.assertIn("Missing required --model.", stderr.getvalue())
+
+    def test_parse_args_uses_model_from_environment(self):
+        with patch.dict(os.environ, {"MODEL": "repo/from-env"}, clear=True):
+            config = launcher_cli._parse_args(["codex"])
+        self.assertEqual(config.model, "repo/from-env")
+
     def test_parse_args_accepts_explicit_cwd(self):
         with TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {}, clear=True):

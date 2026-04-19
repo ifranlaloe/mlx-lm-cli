@@ -82,7 +82,7 @@ mlx_lm launch copilot --model mlx-community/Qwen3.6-35B-A3B-4bit --cwd "$PWD"
 
 | Variable | Default |
 |---|---|
-| `MODEL` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| `MODEL` | _(none)_ (model must be provided via `--model` or env `MODEL`) |
 | `HOST` | `127.0.0.1` |
 | `PORT` | `8080` |
 | `MLX_WAIT_SECONDS` | `30` |

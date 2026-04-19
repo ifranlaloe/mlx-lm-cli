@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
-DEFAULT_MODEL = "mlx-community/Qwen3.6-35B-A3B-4bit"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8080"
 DEFAULT_WAIT_SECONDS = "30"
@@ -277,8 +276,8 @@ def _parse_args(argv: Sequence[str]) -> LaunchConfig:
     parser.add_argument(
         "-m",
         "--model",
-        default=os.getenv("MODEL", DEFAULT_MODEL),
-        help=f"Model ID (default: env MODEL or {DEFAULT_MODEL}).",
+        default=os.getenv("MODEL"),
+        help="Model ID (required; can also be set via env MODEL).",
     )
     parser.add_argument(
         "--host",
@@ -316,6 +315,8 @@ def _parse_args(argv: Sequence[str]) -> LaunchConfig:
         )
 
     try:
+        if args.model is None:
+            parser.error("Missing required --model. Pass --model <id>.")
         model = _validate_non_empty(args.model, "--model")
         host = _validate_non_empty(args.host, "--host")
         port = _validate_int(args.port, "--port", minimum=1, maximum=65535)
