@@ -284,6 +284,18 @@ class TestServer(unittest.TestCase):
             else:
                 self.assertIn(field, error_payload)
 
+    def test_handle_models_includes_configured_remote_model(self):
+        model_id = "mlx-community/Qwen3.6-35B-A3B-4bit"
+        self.response_generator.model_provider.cli_args.model = model_id
+
+        url = f"http://localhost:{self.port}/v1/models"
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+
+        available_ids = {model["id"] for model in response_body["data"]}
+        self.assertIn(model_id, available_ids)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)

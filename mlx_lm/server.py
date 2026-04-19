@@ -2280,26 +2280,34 @@ class APIHandler(BaseHTTPRequestHandler):
         ]
 
         # Create a list of available models
-        models = [
-            {
-                "id": repo.repo_id,
-                "object": "model",
-                "created": self.created,
-            }
-            for repo in downloaded_models
-        ]
+        models = []
+        model_ids = set()
 
-        if self.response_generator.cli_args.model:
-            model_path = Path(self.response_generator.cli_args.model)
+        def add_model(model_id: str):
+            if not model_id:
+                return
+            if filter_repo_id is not None and model_id != filter_repo_id:
+                return
+            if model_id in model_ids:
+                return
+            model_ids.add(model_id)
+            models.append(
+                {
+                    "id": model_id,
+                    "object": "model",
+                    "created": self.created,
+                }
+            )
+
+        for repo in downloaded_models:
+            add_model(repo.repo_id)
+
+        configured_model = self.response_generator.cli_args.model
+        if configured_model:
+            add_model(configured_model)
+            model_path = Path(configured_model)
             if model_path.exists():
-                model_id = str(model_path.resolve())
-                models.append(
-                    {
-                        "id": model_id,
-                        "object": "model",
-                        "created": self.created,
-                    }
-                )
+                add_model(str(model_path.resolve()))
 
         response = {"object": "list", "data": models}
 
