@@ -112,6 +112,7 @@ def _build_env(target: str, model: str, base_url: str) -> Dict[str, str]:
     elif target == "copilot":
         env["COPILOT_PROVIDER_BASE_URL"] = base_url
         _set_default_if_empty(env, "COPILOT_PROVIDER_TYPE", "openai")
+        _set_default_if_empty(env, "COPILOT_PROVIDER_WIRE_API", "responses")
         if not env.get("COPILOT_PROVIDER_BEARER_TOKEN") and not env.get(
             "COPILOT_PROVIDER_API_KEY"
         ):

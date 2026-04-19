@@ -1081,6 +1081,22 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _error_payload(self, message: str) -> Dict[str, Any]:
+        if getattr(self, "path", "") == "/v1/responses":
+            return {
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                }
+            }
+        return {"error": message}
+
+    def _send_json_error(self, status_code: int, message: str):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        self.wfile.write(json.dumps(self._error_payload(message)).encode())
+        self.wfile.flush()
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
@@ -1093,6 +1109,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
             "/chat/completions": self.handle_chat_completions,
+            "/v1/responses": self.handle_responses,
         }
 
         if self.path not in request_factories:
@@ -1104,31 +1121,19 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = self.headers.get("Content-Length")
         if content_length is None:
-            self._set_completion_headers(411)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Content-Length header is required"}).encode()
-            )
+            self._send_json_error(411, "Content-Length header is required")
             return
         try:
             content_length = int(content_length)
         except ValueError:
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Invalid Content-Length header"}).encode()
-            )
+            self._send_json_error(400, "Invalid Content-Length header")
             return
         raw_body = self.rfile.read(content_length)
         try:
             self.body = json.loads(raw_body.decode())
         except json.JSONDecodeError as e:
             logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
-            )
+            self._send_json_error(400, f"Invalid JSON in request body: {e}")
             return
 
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -1137,11 +1142,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(self.body, dict):
             debug_body = json.dumps(self.body, indent="\t")
             logging.error(f"Invalid Request Body: {debug_body}")
-            self._set_completion_headers(400)
-            self.end_headers()
-            self.wfile.write(
-                json.dumps({"error": "Request should be a JSON dictionary"}).encode()
-            )
+            self._send_json_error(400, "Request should be a JSON dictionary")
             return
 
         # Extract request parameters from the body
@@ -1154,6 +1155,8 @@ class APIHandler(BaseHTTPRequestHandler):
         )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
+        if self.max_tokens is None and self.path == "/v1/responses":
+            self.max_tokens = self.body.get("max_output_tokens", None)
         if self.max_tokens is None:
             self.max_tokens = self.body.get(
                 "max_tokens", self.response_generator.cli_args.max_tokens
@@ -1177,7 +1180,11 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except ValueError as e:
+            self._send_json_error(400, str(e))
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1185,7 +1192,11 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        try:
+            request = request_factories[self.path]()
+        except (AssertionError, TypeError, ValueError) as e:
+            self._send_json_error(400, str(e))
+            return
         self.handle_completion(request, stop_words)
 
     def _validate(
@@ -1409,9 +1420,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self._send_json_error(404, str(e))
+            return
+
+        if self.path == "/v1/responses":
+            self.handle_responses_completion(request, args, ctx, response)
             return
 
         # Prepare the headers
@@ -1562,6 +1575,615 @@ class APIHandler(BaseHTTPRequestHandler):
                 "cached_tokens": prompt_cache_count,
             }
         return response
+
+    def _responses_extract_text_content(self, value: Any, field_name: str) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} must be a string or an array")
+
+        fragments = []
+        for idx, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"{field_name}[{idx}] must be an object")
+            item_type = item.get("type")
+            if item_type in {"input_text", "output_text", "text", "summary_text"}:
+                text = item.get("text")
+                if not isinstance(text, str):
+                    raise ValueError(f"{field_name}[{idx}].text must be a string")
+                fragments.append(text)
+            elif item_type in {"input_image", "input_file"}:
+                raise ValueError(
+                    f"{field_name}[{idx}] type '{item_type}' is not supported"
+                )
+            else:
+                raise ValueError(
+                    f"{field_name}[{idx}] has unsupported type '{item_type}'"
+                )
+
+        return "".join(fragments)
+
+    def _responses_normalize_tools(
+        self, tools: Any
+    ) -> Optional[List[Dict[str, Any]]]:
+        if tools is None:
+            return None
+        if not isinstance(tools, list):
+            raise ValueError("tools must be an array")
+
+        normalized = []
+        for idx, tool in enumerate(tools):
+            if not isinstance(tool, dict):
+                raise ValueError(f"tools[{idx}] must be an object")
+            if tool.get("type") != "function":
+                raise ValueError(f"tools[{idx}].type must be 'function'")
+
+            function = tool.get("function")
+            if function is None:
+                name = tool.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError(f"tools[{idx}].name must be a non-empty string")
+                function = {
+                    "name": name,
+                    "description": tool.get("description", "") or "",
+                    "parameters": tool.get("parameters", {}) or {},
+                }
+            elif not isinstance(function, dict):
+                raise ValueError(f"tools[{idx}].function must be an object")
+
+            if not isinstance(function.get("name"), str) or not function.get("name"):
+                raise ValueError(f"tools[{idx}].function.name must be a non-empty string")
+
+            parameters = function.get("parameters", {}) or {}
+            if not isinstance(parameters, dict):
+                raise ValueError(f"tools[{idx}].function.parameters must be an object")
+
+            normalized.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": function["name"],
+                        "description": function.get("description", "") or "",
+                        "parameters": parameters,
+                    },
+                }
+            )
+
+        return normalized or None
+
+    def _responses_build_messages(self, input_value: Any) -> List[Dict[str, Any]]:
+        if isinstance(input_value, str):
+            return [{"role": "user", "content": input_value}]
+        if isinstance(input_value, dict):
+            input_items = [input_value]
+        elif isinstance(input_value, list):
+            input_items = input_value
+        else:
+            raise ValueError("input must be a string, object, or array")
+
+        messages = []
+        for idx, item in enumerate(input_items):
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+
+            if not isinstance(item, dict):
+                raise ValueError(f"input[{idx}] must be a string or object")
+
+            item_type = item.get("type")
+            role = item.get("role")
+            if item_type is None and isinstance(role, str):
+                item_type = "message"
+
+            if item_type == "message":
+                if not isinstance(role, str):
+                    raise ValueError(f"input[{idx}].role must be a string")
+                role = "system" if role == "developer" else role
+                if role not in {"system", "user", "assistant", "tool"}:
+                    raise ValueError(f"input[{idx}].role '{role}' is not supported")
+                message = {
+                    "role": role,
+                    "content": self._responses_extract_text_content(
+                        item.get("content", ""),
+                        f"input[{idx}].content",
+                    ),
+                }
+                if role == "tool":
+                    call_id = item.get("tool_call_id") or item.get("call_id")
+                    if not isinstance(call_id, str) or not call_id:
+                        raise ValueError(
+                            f"input[{idx}].tool_call_id (or call_id) must be a non-empty string"
+                        )
+                    message["tool_call_id"] = call_id
+                messages.append(message)
+            elif item_type == "function_call":
+                call_id = item.get("call_id") or item.get("id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise ValueError(
+                        f"input[{idx}].call_id (or id) must be a non-empty string"
+                    )
+                name = item.get("name")
+                if not isinstance(name, str) or not name:
+                    raise ValueError(f"input[{idx}].name must be a non-empty string")
+                arguments = item.get("arguments", "")
+                if isinstance(arguments, (dict, list)):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                elif not isinstance(arguments, str):
+                    raise ValueError(
+                        f"input[{idx}].arguments must be a string or JSON object"
+                    )
+
+                tool_call = {
+                    "type": "function",
+                    "id": call_id,
+                    "function": {"name": name, "arguments": arguments},
+                }
+                if messages and messages[-1].get("role") == "assistant":
+                    messages[-1].setdefault("tool_calls", []).append(tool_call)
+                    messages[-1].setdefault("content", "")
+                else:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [tool_call],
+                        }
+                    )
+            elif item_type in {
+                "function_call_output",
+                "custom_tool_call_output",
+                "mcp_tool_call_output",
+            }:
+                call_id = item.get("call_id")
+                if not isinstance(call_id, str) or not call_id:
+                    raise ValueError(f"input[{idx}].call_id must be a non-empty string")
+                output_text = self._responses_extract_text_content(
+                    item.get("output", ""),
+                    f"input[{idx}].output",
+                )
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": output_text,
+                    }
+                )
+            elif item_type == "reasoning":
+                summary = item.get("summary", [])
+                if summary is None:
+                    summary = []
+                if not isinstance(summary, list):
+                    raise ValueError(f"input[{idx}].summary must be an array")
+                summary_text = self._responses_extract_text_content(
+                    summary,
+                    f"input[{idx}].summary",
+                )
+                encrypted = item.get("encrypted_content")
+                if encrypted is not None and not isinstance(encrypted, str):
+                    raise ValueError(f"input[{idx}].encrypted_content must be a string")
+                reasoning_text = f"{summary_text}{encrypted or ''}"
+                if reasoning_text:
+                    messages.append({"role": "assistant", "content": reasoning_text})
+            else:
+                raise ValueError(f"input[{idx}] has unsupported type '{item_type}'")
+
+        return messages
+
+    def _responses_message_item(self, text: str, status: str) -> Dict[str, Any]:
+        return {
+            "id": self.responses_item_id,
+            "type": "message",
+            "status": status,
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                    "logprobs": [],
+                }
+            ],
+        }
+
+    def _responses_function_call_item(
+        self,
+        tool_call: Dict[str, Any],
+        item_id: str,
+        status: str,
+        arguments: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        function = tool_call.get("function", {})
+        if arguments is None:
+            arguments = function.get("arguments", "")
+        return {
+            "id": item_id,
+            "type": "function_call",
+            "status": status,
+            "call_id": tool_call.get("id", str(uuid.uuid4())),
+            "name": function.get("name", ""),
+            "arguments": arguments,
+        }
+
+    def _responses_usage(
+        self,
+        prompt_token_count: int,
+        completion_token_count: int,
+        prompt_cache_count: Optional[int],
+    ) -> Dict[str, Any]:
+        cached_tokens = 0
+        if isinstance(prompt_cache_count, int) and prompt_cache_count > 0:
+            cached_tokens = prompt_cache_count
+        return {
+            "input_tokens": prompt_token_count,
+            "output_tokens": completion_token_count,
+            "total_tokens": prompt_token_count + completion_token_count,
+            "input_tokens_details": {"cached_tokens": cached_tokens},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+
+    def _responses_response_object(
+        self,
+        status: str,
+        output: List[Dict[str, Any]],
+        usage: Optional[Dict[str, Any]] = None,
+        error: Optional[Dict[str, Any]] = None,
+        completed: bool = False,
+    ) -> Dict[str, Any]:
+        text_format = {"type": "text"}
+        format_cfg = None
+        if isinstance(getattr(self, "responses_text_config", None), dict):
+            format_cfg = self.responses_text_config.get("format")
+        if isinstance(format_cfg, dict) and isinstance(format_cfg.get("type"), str):
+            text_format = {"type": format_cfg["type"]}
+            for key in ("name", "schema", "strict"):
+                if key in format_cfg:
+                    text_format[key] = format_cfg[key]
+
+        response = {
+            "id": self.request_id,
+            "object": "response",
+            "created_at": self.created,
+            "completed_at": int(time.time()) if completed else None,
+            "status": status,
+            "incomplete_details": None,
+            "model": self.requested_model,
+            "previous_response_id": None,
+            "instructions": getattr(self, "responses_instructions", None),
+            "output": output,
+            "error": error,
+            "tools": getattr(self, "responses_original_tools", []),
+            "tool_choice": "auto",
+            "truncation": getattr(self, "responses_truncation", "disabled"),
+            "parallel_tool_calls": True,
+            "text": {"format": text_format},
+            "top_p": float(self.top_p),
+            "presence_penalty": self.presence_penalty,
+            "frequency_penalty": self.frequency_penalty,
+            "top_logprobs": 0,
+            "temperature": float(self.temperature),
+            "reasoning": getattr(self, "responses_reasoning_config", None),
+            "usage": usage,
+            "max_output_tokens": getattr(self, "responses_max_output_tokens", None),
+            "max_tool_calls": None,
+            "store": False,
+            "background": getattr(self, "responses_background", False),
+            "service_tier": "default",
+            "metadata": getattr(self, "responses_metadata", {}),
+            "safety_identifier": None,
+            "prompt_cache_key": None,
+        }
+        return response
+
+    def _responses_write_event(self, event_type: str, payload: Dict[str, Any]):
+        event_payload = {
+            "type": event_type,
+            "sequence_number": self.responses_sequence_number,
+        }
+        self.responses_sequence_number += 1
+        event_payload.update(payload)
+        encoded = json.dumps(event_payload).encode()
+        self.wfile.write(f"event: {event_type}\ndata: ".encode() + encoded + b"\n\n")
+        self.wfile.flush()
+
+    def handle_responses_completion(
+        self,
+        request: CompletionRequest,
+        args: GenerationArguments,
+        ctx: GenerationContext,
+        response,
+    ):
+        if self.stream:
+            self._set_stream_headers(200)
+            self.end_headers()
+        else:
+            self._set_completion_headers(200)
+
+        tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, False)
+        prev_state = None
+        finish_reason = "stop"
+        tool_text = ""
+        raw_tool_calls = []
+        text = ""
+        reasoning_text = ""
+        tokens = []
+        message_started = False
+        message_output_index = 0
+
+        try:
+            if self.stream:
+                self._responses_write_event(
+                    "response.created",
+                    {
+                        "response": self._responses_response_object(
+                            status="in_progress",
+                            output=[],
+                        )
+                    },
+                )
+                self._responses_write_event(
+                    "response.in_progress",
+                    {
+                        "response": self._responses_response_object(
+                            status="in_progress",
+                            output=[],
+                        )
+                    },
+                )
+
+            for gen in response:
+                logging.debug(gen.text)
+                if gen.state == "reasoning":
+                    reasoning_text += gen.text
+                elif gen.state == "tool":
+                    tool_text += gen.text
+                elif gen.state == "normal":
+                    if prev_state == "tool":
+                        raw_tool_calls.append(tool_text)
+                        tool_text = ""
+                    if gen.text:
+                        text += gen.text
+                        if self.stream:
+                            if not message_started:
+                                self._responses_write_event(
+                                    "response.output_item.added",
+                                    {
+                                        "output_index": message_output_index,
+                                        "item": self._responses_message_item(
+                                            "",
+                                            "in_progress",
+                                        ),
+                                    },
+                                )
+                                message_started = True
+                            self._responses_write_event(
+                                "response.output_text.delta",
+                                {
+                                    "item_id": self.responses_item_id,
+                                    "output_index": message_output_index,
+                                    "content_index": 0,
+                                    "delta": gen.text,
+                                    "logprobs": [],
+                                },
+                            )
+
+                tokens.append(gen.token)
+                if gen.finish_reason is not None:
+                    finish_reason = gen.finish_reason
+                prev_state = gen.state
+
+            if prev_state == "tool" and tool_text:
+                raw_tool_calls.append(tool_text)
+
+            if finish_reason == "stop" and raw_tool_calls:
+                finish_reason = "tool_calls"
+
+            tool_calls = tool_formatter(raw_tool_calls)
+            tool_call_items = [
+                (f"fc_{uuid.uuid4()}", tool_call) for tool_call in tool_calls
+            ]
+            final_text = text or reasoning_text
+
+            output_items = []
+            if final_text:
+                output_items.append(self._responses_message_item(final_text, "completed"))
+            for item_id, tool_call in tool_call_items:
+                output_items.append(
+                    self._responses_function_call_item(
+                        tool_call,
+                        item_id,
+                        "completed",
+                    )
+                )
+            if not output_items:
+                output_items.append(self._responses_message_item("", "completed"))
+
+            completed_response = self._responses_response_object(
+                status="completed",
+                output=output_items,
+                usage=self._responses_usage(
+                    prompt_token_count=len(ctx.prompt),
+                    completion_token_count=len(tokens),
+                    prompt_cache_count=ctx.prompt_cache_count,
+                ),
+                completed=True,
+            )
+
+            if self.stream:
+                output_index = 0
+                if final_text or not tool_call_items:
+                    if not message_started:
+                        self._responses_write_event(
+                            "response.output_item.added",
+                            {
+                                "output_index": output_index,
+                                "item": self._responses_message_item("", "in_progress"),
+                            },
+                        )
+                    self._responses_write_event(
+                        "response.output_text.done",
+                        {
+                            "item_id": self.responses_item_id,
+                            "output_index": output_index,
+                            "content_index": 0,
+                            "text": final_text,
+                            "logprobs": [],
+                        },
+                    )
+                    self._responses_write_event(
+                        "response.output_item.done",
+                        {
+                            "output_index": output_index,
+                            "item": self._responses_message_item(
+                                final_text,
+                                "completed",
+                            ),
+                        },
+                    )
+                    output_index += 1
+
+                for item_id, tool_call in tool_call_items:
+                    in_progress_item = self._responses_function_call_item(
+                        tool_call,
+                        item_id,
+                        "in_progress",
+                        arguments="",
+                    )
+                    done_item = self._responses_function_call_item(
+                        tool_call,
+                        item_id,
+                        "completed",
+                    )
+                    self._responses_write_event(
+                        "response.output_item.added",
+                        {
+                            "output_index": output_index,
+                            "item": in_progress_item,
+                        },
+                    )
+                    if done_item["arguments"]:
+                        self._responses_write_event(
+                            "response.function_call_arguments.delta",
+                            {
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "delta": done_item["arguments"],
+                            },
+                        )
+                    self._responses_write_event(
+                        "response.function_call_arguments.done",
+                        {
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "arguments": done_item["arguments"],
+                        },
+                    )
+                    self._responses_write_event(
+                        "response.output_item.done",
+                        {
+                            "output_index": output_index,
+                            "item": done_item,
+                        },
+                    )
+                    output_index += 1
+
+                self._responses_write_event(
+                    "response.completed",
+                    {"response": completed_response},
+                )
+            else:
+                response_json = json.dumps(completed_response).encode()
+                self.send_header("Content-Length", str(len(response_json)))
+                self.end_headers()
+                self.wfile.write(response_json)
+                self.wfile.flush()
+        except Exception as e:
+            if self.stream:
+                self._responses_write_event(
+                    "response.failed",
+                    {
+                        "response": self._responses_response_object(
+                            status="failed",
+                            output=[],
+                            error={
+                                "code": "generation_error",
+                                "message": str(e),
+                            },
+                            completed=True,
+                        )
+                    },
+                )
+            else:
+                payload = json.dumps(self._error_payload(str(e))).encode()
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                self.wfile.flush()
+        finally:
+            ctx.stop()
+
+    def handle_responses(self) -> CompletionRequest:
+        body = self.body
+        if body.get("previous_response_id") is not None:
+            raise ValueError("previous_response_id is not supported")
+        if body.get("conversation") is not None:
+            raise ValueError("conversation is not supported")
+        if "input" not in body:
+            raise ValueError("Request did not contain input")
+
+        instructions = body.get("instructions", "")
+        if instructions is None:
+            instructions = ""
+        if not isinstance(instructions, str):
+            raise ValueError("instructions must be a string")
+
+        text_cfg = body.get("text")
+        if text_cfg is not None and not isinstance(text_cfg, dict):
+            raise ValueError("text must be an object")
+
+        reasoning_cfg = body.get("reasoning")
+        if reasoning_cfg is not None and not isinstance(reasoning_cfg, dict):
+            raise ValueError("reasoning must be an object")
+
+        truncation = body.get("truncation", "disabled")
+        if truncation is None:
+            truncation = "disabled"
+        if not isinstance(truncation, str):
+            raise ValueError("truncation must be a string")
+
+        metadata = body.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise ValueError("metadata must be an object")
+
+        messages = self._responses_build_messages(body.get("input"))
+        if instructions:
+            messages.insert(0, {"role": "system", "content": instructions})
+        if not messages:
+            raise ValueError("Request input must not be empty")
+
+        self.request_id = f"resp_{uuid.uuid4()}"
+        self.object_type = "response"
+        self.responses_item_id = f"msg_{uuid.uuid4()}"
+        self.responses_sequence_number = 0
+        self.responses_instructions = instructions or None
+        self.responses_text_config = text_cfg
+        self.responses_reasoning_config = reasoning_cfg
+        self.responses_original_tools = body.get("tools") or []
+        self.responses_background = bool(body.get("background", False))
+        self.responses_metadata = metadata
+        self.responses_truncation = truncation
+        self.responses_max_output_tokens = body.get("max_output_tokens")
+
+        return CompletionRequest(
+            "chat",
+            "",
+            messages,
+            self._responses_normalize_tools(body.get("tools")),
+            None,
+        )
 
     def handle_chat_completions(self) -> CompletionRequest:
         """

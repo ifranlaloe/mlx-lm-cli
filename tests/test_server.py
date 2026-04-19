@@ -205,6 +205,85 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_handle_responses(self):
+        url = f"http://localhost:{self.port}/v1/responses"
+        post_data = {
+            "model": "chat_model",
+            "input": "Hello!",
+            "max_output_tokens": 10,
+        }
+        response = requests.post(url, json=post_data)
+        self.assertEqual(response.status_code, 200)
+
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["object"], "response")
+        self.assertEqual(response_body["status"], "completed")
+        self.assertIn("id", response_body)
+        self.assertIn("output", response_body)
+        self.assertIsInstance(response_body["output"], list)
+        self.assertGreater(len(response_body["output"]), 0)
+        self.assertIn("usage", response_body)
+        self.assertIn("input_tokens", response_body["usage"])
+        self.assertIn("output_tokens", response_body["usage"])
+
+    def test_handle_responses_streaming(self):
+        url = f"http://localhost:{self.port}/v1/responses"
+        post_data = {
+            "model": "chat_model",
+            "input": "Hello!",
+            "stream": True,
+            "max_output_tokens": 10,
+        }
+        response = requests.post(url, json=post_data, stream=True)
+        self.assertEqual(response.status_code, 200)
+
+        saw_done_sentinel = False
+        event_types = []
+        for chunk in response.iter_lines():
+            if not chunk:
+                continue
+            line = chunk.decode("utf-8")
+            if line == "data: [DONE]":
+                saw_done_sentinel = True
+                continue
+            if line.startswith("data: "):
+                event = json.loads(line[6:])
+                event_types.append(event.get("type"))
+
+        self.assertIn("response.created", event_types)
+        self.assertIn("response.in_progress", event_types)
+        self.assertIn("response.completed", event_types)
+        self.assertTrue(
+            any(
+                event_type in {"response.output_item.added", "response.output_text.delta"}
+                for event_type in event_types
+            )
+        )
+        self.assertFalse(saw_done_sentinel)
+
+    def test_handle_responses_rejects_stateful_fields(self):
+        url = f"http://localhost:{self.port}/v1/responses"
+        for field, value in [
+            ("previous_response_id", "resp_123"),
+            ("conversation", "conv_123"),
+        ]:
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "input": "Hello!",
+                    field: value,
+                },
+            )
+            self.assertEqual(response.status_code, 400)
+            response_body = json.loads(response.text)
+            self.assertIn("error", response_body)
+            error_payload = response_body["error"]
+            if isinstance(error_payload, dict):
+                self.assertIn(field, error_payload["message"])
+            else:
+                self.assertIn(field, error_payload)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)

@@ -37,7 +37,7 @@ class TestLauncherCLI(unittest.TestCase):
         self.assertEqual(ex.exception.code, 2)
         self.assertIn("Unknown launcher arg(s): --bad-flag", stderr.getvalue())
 
-    def test_copilot_env_does_not_force_wire_api(self):
+    def test_copilot_env_defaults_to_responses_wire_api(self):
         with patch.dict(os.environ, {}, clear=True):
             env = launcher_cli._build_env(
                 "copilot",
@@ -45,7 +45,7 @@ class TestLauncherCLI(unittest.TestCase):
                 "http://127.0.0.1:8080/v1",
             )
         self.assertEqual(env["COPILOT_PROVIDER_BASE_URL"], "http://127.0.0.1:8080/v1")
-        self.assertNotIn("COPILOT_PROVIDER_WIRE_API", env)
+        self.assertEqual(env["COPILOT_PROVIDER_WIRE_API"], "responses")
         self.assertEqual(env["COPILOT_PROVIDER_API_KEY"], "local")
 
     def test_copilot_env_preserves_wire_api_if_preconfigured(self):
