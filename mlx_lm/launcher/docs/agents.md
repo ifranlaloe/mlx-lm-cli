@@ -58,6 +58,7 @@ Notes:
 - `mlx_lm/launcher/docs/github-copilot.md`
 - `mlx_lm/launcher/docs/claude-code.md`
 - `mlx_lm/launcher/docs/open-code.md`
+- `mlx_lm/launcher/docs/responses-api.md`
 
 ## Validation baseline
 After launch-related changes:
