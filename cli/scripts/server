@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPTS_DIR/lib.sh"
+
+VENV_DIR="${VENV_DIR:-$SCRIPTS_DIR/../../.venv}"
+
+usage() {
+  cat <<'EOF'
+MLX-LM server launcher:
+  cli/scripts/server [--model MODEL] [--host HOST] [--port PORT] [mlx_lm.server flags...]
+
+Examples:
+  cli/scripts/server
+  cli/scripts/server --model mlx-community/Qwen3.6-35B-A3B-4bit
+  cli/scripts/server --host 0.0.0.0 --port 8080 -- --log-level INFO
+
+Environment overrides:
+  MODEL      default: mlx-community/Qwen3.6-35B-A3B-4bit
+  HOST       default: 127.0.0.1
+  PORT       default: 8080
+  VENV_DIR   default: ./.venv
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+mlx_parse_server_args "$@"
+MODEL="$MLX_MODEL"
+HOST="$MLX_HOST"
+PORT="$MLX_PORT"
+SERVER_ARGS=("${MLX_SERVER_ARGS[@]+"${MLX_SERVER_ARGS[@]}"}")
+
+if [[ ! -d "$VENV_DIR" ]]; then
+  mlx_die "Missing virtual environment at: $VENV_DIR"
+fi
+
+# shellcheck source=/dev/null
+source "$VENV_DIR/bin/activate"
+
+mlx_require_command mlx_lm
+
+echo "Serving model: $MODEL"
+echo "Endpoint: http://$HOST:$PORT/v1"
+
+exec mlx_lm server --model "$MODEL" --host "$HOST" --port "$PORT" ${SERVER_ARGS[@]+"${SERVER_ARGS[@]}"}
