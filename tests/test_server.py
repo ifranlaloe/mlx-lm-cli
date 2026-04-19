@@ -284,6 +284,116 @@ class TestServer(unittest.TestCase):
             else:
                 self.assertIn(field, error_payload)
 
+    def test_handle_responses_accepts_non_function_tool_types(self):
+        url = f"http://localhost:{self.port}/v1/responses"
+        response = requests.post(
+            url,
+            json={
+                "model": "chat_model",
+                "input": "Hello!",
+                "max_output_tokens": 10,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "echo",
+                        "description": "Echo text.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                        },
+                    },
+                    {"type": "local_shell"},
+                    {"type": "web_search", "external_web_access": False},
+                    {"type": "image_generation", "output_format": "png"},
+                    {
+                        "type": "custom",
+                        "name": "apply_patch",
+                        "description": "Apply patch content.",
+                        "format": {
+                            "type": "grammar",
+                            "syntax": "lark",
+                            "definition": "start: /.+/",
+                        },
+                    },
+                    {
+                        "type": "tool_search",
+                        "execution": "deferred",
+                        "description": "Search deferred tools.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                        },
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "mcp",
+                        "description": "MCP tools namespace.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "list_files",
+                                "description": "List files.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                },
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["object"], "response")
+
+    def test_handle_responses_merges_system_messages_into_single_preamble(self):
+        url = f"http://localhost:{self.port}/v1/responses"
+        captured = {}
+        original_generate = self.response_generator.generate
+
+        def wrapped_generate(request, args, progress_callback=None):
+            captured["messages"] = request.messages
+            return original_generate(
+                request, args, progress_callback=progress_callback
+            )
+
+        self.response_generator.generate = wrapped_generate
+        try:
+            response = requests.post(
+                url,
+                json={
+                    "model": "chat_model",
+                    "instructions": "Global instruction.",
+                    "input": [
+                        {"type": "message", "role": "user", "content": "Hello"},
+                        {
+                            "type": "message",
+                            "role": "developer",
+                            "content": "Secondary developer instruction.",
+                        },
+                        {
+                            "type": "message",
+                            "role": "system",
+                            "content": "Additional system instruction.",
+                        },
+                    ],
+                    "max_output_tokens": 10,
+                },
+            )
+        finally:
+            self.response_generator.generate = original_generate
+
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["object"], "response")
+        messages = captured["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(sum(1 for msg in messages if msg["role"] == "system"), 1)
+        self.assertIn("Global instruction.", messages[0]["content"])
+        self.assertIn("Secondary developer instruction.", messages[0]["content"])
+        self.assertIn("Additional system instruction.", messages[0]["content"])
+
     def test_handle_models_includes_configured_remote_model(self):
         model_id = "mlx-community/Qwen3.6-35B-A3B-4bit"
         self.response_generator.model_provider.cli_args.model = model_id

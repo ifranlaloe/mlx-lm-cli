@@ -1420,7 +1420,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._send_json_error(404, str(e))
+            message = str(e)
+            status_code = 404 if "not found" in message.lower() else 400
+            self._send_json_error(status_code, message)
             return
 
         if self.path == "/v1/responses":
@@ -1613,42 +1615,118 @@ class APIHandler(BaseHTTPRequestHandler):
         if not isinstance(tools, list):
             raise ValueError("tools must be an array")
 
-        normalized = []
-        for idx, tool in enumerate(tools):
-            if not isinstance(tool, dict):
-                raise ValueError(f"tools[{idx}] must be an object")
-            if tool.get("type") != "function":
-                raise ValueError(f"tools[{idx}].type must be 'function'")
+        def _function_tool(name: str, description: str, parameters: Any) -> Dict[str, Any]:
+            if not isinstance(name, str) or not name:
+                raise ValueError("tool function name must be a non-empty string")
+            if parameters is None:
+                parameters = {}
+            if not isinstance(parameters, dict):
+                raise ValueError("tool function parameters must be an object")
+            return {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description or "",
+                    "parameters": parameters,
+                },
+            }
 
+        def _generic_parameters() -> Dict[str, Any]:
+            return {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": True,
+            }
+
+        def _normalize_function_like_tool(
+            tool: Dict[str, Any], idx: int, name_prefix: str = ""
+        ) -> Dict[str, Any]:
             function = tool.get("function")
             if function is None:
                 name = tool.get("name")
                 if not isinstance(name, str) or not name:
                     raise ValueError(f"tools[{idx}].name must be a non-empty string")
-                function = {
-                    "name": name,
-                    "description": tool.get("description", "") or "",
-                    "parameters": tool.get("parameters", {}) or {},
-                }
-            elif not isinstance(function, dict):
+                if name_prefix:
+                    name = f"{name_prefix}.{name}"
+                return _function_tool(
+                    name=name,
+                    description=tool.get("description", "") or "",
+                    parameters=tool.get("parameters", {}) or {},
+                )
+
+            if not isinstance(function, dict):
                 raise ValueError(f"tools[{idx}].function must be an object")
-
-            if not isinstance(function.get("name"), str) or not function.get("name"):
+            name = function.get("name")
+            if not isinstance(name, str) or not name:
                 raise ValueError(f"tools[{idx}].function.name must be a non-empty string")
+            if name_prefix:
+                name = f"{name_prefix}.{name}"
+            return _function_tool(
+                name=name,
+                description=function.get("description", "") or "",
+                parameters=function.get("parameters", {}) or {},
+            )
 
-            parameters = function.get("parameters", {}) or {}
-            if not isinstance(parameters, dict):
-                raise ValueError(f"tools[{idx}].function.parameters must be an object")
+        normalized = []
+        for idx, tool in enumerate(tools):
+            if not isinstance(tool, dict):
+                raise ValueError(f"tools[{idx}] must be an object")
+            tool_type = tool.get("type")
+            if not isinstance(tool_type, str):
+                raise ValueError(f"tools[{idx}].type must be a string")
+
+            if tool_type == "function":
+                normalized.append(_normalize_function_like_tool(tool, idx))
+                continue
+
+            if tool_type == "namespace":
+                namespace = tool.get("name")
+                if not isinstance(namespace, str) or not namespace:
+                    raise ValueError(f"tools[{idx}].name must be a non-empty string")
+                namespace_tools = tool.get("tools")
+                if not isinstance(namespace_tools, list):
+                    raise ValueError(f"tools[{idx}].tools must be an array")
+                for sub_idx, namespace_tool in enumerate(namespace_tools):
+                    if not isinstance(namespace_tool, dict):
+                        raise ValueError(
+                            f"tools[{idx}].tools[{sub_idx}] must be an object"
+                        )
+                    if namespace_tool.get("type") != "function":
+                        raise ValueError(
+                            f"tools[{idx}].tools[{sub_idx}].type must be 'function'"
+                        )
+                    normalized.append(
+                        _normalize_function_like_tool(
+                            namespace_tool,
+                            idx,
+                            name_prefix=namespace,
+                        )
+                    )
+                continue
+
+            # Codex can send non-function Responses tool types (e.g. local_shell,
+            # web_search, image_generation, custom). Convert them to permissive
+            # function-style tools so local chat-template tool calling can proceed.
+            logging.warning(
+                "Converting unsupported Responses tool type '%s' to function compatibility shim",
+                tool_type,
+            )
+
+            shim_name = tool.get("name")
+            if not isinstance(shim_name, str) or not shim_name:
+                shim_name = tool_type
+
+            shim_description = tool.get("description", "") or ""
+            shim_parameters = tool.get("parameters")
+            if not isinstance(shim_parameters, dict):
+                shim_parameters = _generic_parameters()
 
             normalized.append(
-                {
-                    "type": "function",
-                    "function": {
-                        "name": function["name"],
-                        "description": function.get("description", "") or "",
-                        "parameters": parameters,
-                    },
-                }
+                _function_tool(
+                    name=shim_name,
+                    description=shim_description,
+                    parameters=shim_parameters,
+                )
             )
 
         return normalized or None
@@ -1770,6 +1848,31 @@ class APIHandler(BaseHTTPRequestHandler):
                 raise ValueError(f"input[{idx}] has unsupported type '{item_type}'")
 
         return messages
+
+    def _responses_finalize_messages(
+        self, messages: List[Dict[str, Any]], instructions: str
+    ) -> List[Dict[str, Any]]:
+        system_parts = []
+        if instructions:
+            system_parts.append(instructions)
+
+        non_system_messages = []
+        for message in messages:
+            if message.get("role") == "system":
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    if content:
+                        system_parts.append(content)
+                elif content is not None:
+                    system_parts.append(str(content))
+                continue
+            non_system_messages.append(message)
+
+        finalized = []
+        if system_parts:
+            finalized.append({"role": "system", "content": "\n\n".join(system_parts)})
+        finalized.extend(non_system_messages)
+        return finalized
 
     def _responses_message_item(self, text: str, status: str) -> Dict[str, Any]:
         return {
@@ -2159,8 +2262,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("metadata must be an object")
 
         messages = self._responses_build_messages(body.get("input"))
-        if instructions:
-            messages.insert(0, {"role": "system", "content": instructions})
+        messages = self._responses_finalize_messages(messages, instructions)
+
         if not messages:
             raise ValueError("Request input must not be empty")
 
