@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
@@ -15,6 +16,7 @@ DEFAULT_MODEL = "mlx-community/Qwen3.6-35B-A3B-4bit"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = "8080"
 DEFAULT_WAIT_SECONDS = "30"
+CODEX_PROFILE_NAME = "mlx-launch"
 
 TARGET_BINARIES = {
     "codex": ("CODEX_CMD", "codex"),
@@ -151,6 +153,70 @@ def _print_launch_message(target: str, env: Dict[str, str]):
         )
 
 
+def _with_trailing_slash(url: str) -> str:
+    return url if url.endswith("/") else f"{url}/"
+
+
+def _upsert_toml_section(content: str, header: str, lines: Sequence[str]) -> str:
+    block = "\n".join([header, *lines]) + "\n"
+    idx = content.find(header)
+    if idx < 0:
+        if content and not content.endswith("\n"):
+            content += "\n"
+        if content:
+            content += "\n"
+        return content + block
+
+    rest = content[idx + len(header) :]
+    end_idx = rest.find("\n[")
+    if end_idx >= 0:
+        return content[:idx] + block + rest[end_idx + 1 :]
+    return content[:idx] + block
+
+
+def _ensure_codex_config(base_url: str):
+    codex_dir = Path.home() / ".codex"
+    codex_dir.mkdir(parents=True, exist_ok=True)
+    config_path = codex_dir / "config.toml"
+    content = ""
+    if config_path.exists():
+        content = config_path.read_text(encoding="utf-8")
+
+    provider_base_url = _with_trailing_slash(base_url)
+    profile_header = f"[profiles.{CODEX_PROFILE_NAME}]"
+    provider_header = f"[model_providers.{CODEX_PROFILE_NAME}]"
+
+    content = _upsert_toml_section(
+        content,
+        profile_header,
+        [
+            f'openai_base_url = "{provider_base_url}"',
+            f'model_provider = "{CODEX_PROFILE_NAME}"',
+        ],
+    )
+    content = _upsert_toml_section(
+        content,
+        provider_header,
+        [
+            'name = "MLX"',
+            f'base_url = "{provider_base_url}"',
+        ],
+    )
+    config_path.write_text(content, encoding="utf-8")
+
+
+def _build_launch_command(
+    target: str, command: str, model: str, base_url: str, app_args: Sequence[str]
+) -> List[str]:
+    if target != "codex":
+        return [command, *app_args]
+
+    codex_args = ["--profile", CODEX_PROFILE_NAME]
+    if model:
+        codex_args += ["-m", model]
+    return [command, *codex_args, *app_args]
+
+
 def _parse_args(argv: Sequence[str]) -> LaunchConfig:
     parser = argparse.ArgumentParser(
         description=(
@@ -231,7 +297,20 @@ def main():
             f'mlx_lm server --model "{config.model}" --host "{config.host}" --port "{config.port}"'
         )
 
+    if config.target == "codex":
+        try:
+            _ensure_codex_config(base_url)
+        except OSError as e:
+            raise SystemExit(f"Failed to configure Codex profile: {e}") from e
+
     launch_env = _build_env(config.target, config.model, base_url)
+    launch_command = _build_launch_command(
+        config.target,
+        command,
+        config.model,
+        base_url,
+        config.app_args,
+    )
     _print_launch_message(config.target, launch_env)
-    completed = subprocess.run([command, *config.app_args], env=launch_env, check=False)
+    completed = subprocess.run(launch_command, env=launch_env, check=False)
     raise SystemExit(completed.returncode)

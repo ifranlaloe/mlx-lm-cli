@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 
@@ -65,6 +66,82 @@ class TestLauncherCLI(unittest.TestCase):
         cli_module_path = Path(__file__).resolve().parents[1] / "mlx_lm" / "cli.py"
         text = cli_module_path.read_text(encoding="utf-8")
         self.assertIn('"launch"', text)
+
+    def test_codex_launch_command_uses_profile_and_model(self):
+        model = "mlx-community/Qwen3.6-35B-A3B-4bit"
+        base_url = "http://127.0.0.1:8080/v1"
+        command = launcher_cli._build_launch_command(
+            "codex",
+            "codex",
+            model,
+            base_url,
+            ["--help"],
+        )
+
+        self.assertEqual(command[:3], ["codex", "--profile", launcher_cli.CODEX_PROFILE_NAME])
+        self.assertEqual(command[3:5], ["-m", model])
+        self.assertEqual(command[-1], "--help")
+
+    def test_non_codex_launch_command_is_passthrough(self):
+        command = launcher_cli._build_launch_command(
+            "copilot",
+            "copilot",
+            "ignored",
+            "http://127.0.0.1:8080/v1",
+            ["--help"],
+        )
+        self.assertEqual(command, ["copilot", "--help"])
+
+    def test_ensure_codex_config_writes_profile_and_provider_sections(self):
+        with TemporaryDirectory() as tmp:
+            with patch.object(launcher_cli.Path, "home", return_value=Path(tmp)):
+                launcher_cli._ensure_codex_config("http://127.0.0.1:8080/v1")
+
+            config_path = Path(tmp) / ".codex" / "config.toml"
+            content = config_path.read_text(encoding="utf-8")
+            self.assertIn(f"[profiles.{launcher_cli.CODEX_PROFILE_NAME}]", content)
+            self.assertIn(
+                f'model_provider = "{launcher_cli.CODEX_PROFILE_NAME}"',
+                content,
+            )
+            self.assertIn(f"[model_providers.{launcher_cli.CODEX_PROFILE_NAME}]", content)
+            self.assertIn('name = "MLX"', content)
+            self.assertIn('base_url = "http://127.0.0.1:8080/v1/"', content)
+
+    def test_ensure_codex_config_replaces_existing_sections(self):
+        with TemporaryDirectory() as tmp:
+            codex_dir = Path(tmp) / ".codex"
+            codex_dir.mkdir(parents=True, exist_ok=True)
+            config_path = codex_dir / "config.toml"
+            config_path.write_text(
+                (
+                    f"[profiles.{launcher_cli.CODEX_PROFILE_NAME}]\n"
+                    'openai_base_url = "http://old:1234/v1/"\n'
+                    "\n"
+                    f"[model_providers.{launcher_cli.CODEX_PROFILE_NAME}]\n"
+                    'name = "Old"\n'
+                    'base_url = "http://old:1234/v1/"\n'
+                    "\n"
+                    "[other]\n"
+                    'key = "value"\n'
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.object(launcher_cli.Path, "home", return_value=Path(tmp)):
+                launcher_cli._ensure_codex_config("http://127.0.0.1:8080/v1")
+
+            content = config_path.read_text(encoding="utf-8")
+            self.assertNotIn("old:1234", content)
+            self.assertEqual(
+                content.count(f"[profiles.{launcher_cli.CODEX_PROFILE_NAME}]"),
+                1,
+            )
+            self.assertEqual(
+                content.count(f"[model_providers.{launcher_cli.CODEX_PROFILE_NAME}]"),
+                1,
+            )
+            self.assertIn("[other]", content)
 
 
 if __name__ == "__main__":
