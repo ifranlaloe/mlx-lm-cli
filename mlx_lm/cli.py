@@ -13,6 +13,7 @@ def main():
         "evaluate",
         "fuse",
         "generate",
+        "launch",
         "lora",
         "manage",
         "perplexity",

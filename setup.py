@@ -34,6 +34,7 @@ setup(
     ],
     packages=[
         "mlx_lm",
+        "mlx_lm.launcher",
         "mlx_lm.models",
         "mlx_lm.quant",
         "mlx_lm.tuner",
@@ -64,6 +65,7 @@ setup(
             "mlx_lm.fuse = mlx_lm.fuse:main",
             "mlx_lm.generate = mlx_lm.generate:main",
             "mlx_lm.lora = mlx_lm.lora:main",
+            "mlx_lm.launch = mlx_lm.launch:main",
             "mlx_lm.perplexity = mlx_lm.perplexity:main",
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.share = mlx_lm.share:main",
